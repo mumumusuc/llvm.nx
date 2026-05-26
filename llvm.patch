@@ -1,0 +1,93 @@
+diff --git a/clang/lib/Driver/ToolChains/Arch/AArch64.cpp b/clang/lib/Driver/ToolChains/Arch/AArch64.cpp
+index cc6e408f4..59162443e 100644
+--- a/clang/lib/Driver/ToolChains/Arch/AArch64.cpp
++++ b/clang/lib/Driver/ToolChains/Arch/AArch64.cpp
+@@ -273,10 +273,16 @@ void aarch64::getAArch64TargetFeatures(const Driver &D,
+       Features.push_back("+tpidr-el2");
+     else if (Mtp == "el1" || Mtp == "tpidr_el1")
+       Features.push_back("+tpidr-el1");
++    else if (Mtp == "el0" && Mtp == "tpidr_el0")
++      Features.push_back("+tpidr-el0");
+     else if (Mtp == "tpidrro_el0")
+       Features.push_back("+tpidrro-el0");
+-    else if (Mtp != "el0" && Mtp != "tpidr_el0")
++    else if (Mtp == "soft")
++      Features.push_back("+read-tp-soft");
++    else
+       D.Diag(diag::err_drv_invalid_mtp) << A->getAsString(Args);
++  } else {
++    D.Diag(diag::err_drv_missing_arg_mtp) << "-mtp=";
+   }
+ 
+   // Enable/disable straight line speculation hardening.
+diff --git a/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp b/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
+index 473aaa942..8d01ba27e 100644
+--- a/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
+@@ -1567,6 +1567,17 @@ bool AArch64ExpandPseudo::expandMI(MachineBasicBlock &MBB,
+     return true;
+   }
+ 
++  case AArch64::GETbaseTLSsoft: {
++    Register DstReg = MI.getOperand(0).getReg();
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(AArch64::BL))
++            .addExternalSymbol("__aarch64_read_tp")
++            .cloneMemRefs(MI);
++    transferImpOps(MI, MIB, MIB);
++    MI.eraseFromParent();
++    return true;
++  }
++
+   case AArch64::MOVi32imm:
+     return expandMOVImm(MBB, MBBI, 32);
+   case AArch64::MOVi64imm:
+diff --git a/llvm/lib/Target/AArch64/AArch64Features.td b/llvm/lib/Target/AArch64/AArch64Features.td
+index 4beec8c91..4a9609c5c 100644
+--- a/llvm/lib/Target/AArch64/AArch64Features.td
++++ b/llvm/lib/Target/AArch64/AArch64Features.td
+@@ -903,6 +903,10 @@ def FeatureDisableMaximizeScalableBandwidth : SubtargetFeature< "disable-maximiz
+ def FeatureAvoidLDAPUR : SubtargetFeature<"avoid-ldapur", "AvoidLDAPUR", "true",
+   "Prefer add+ldapr to offset ldapur">;
+ 
++// Read the TLS by calling __aarch64_read_tp
++def FeatureReadTpSoft : SubtargetFeature<"read-tp-soft", "ReadTpSoft",
++  "true", "Read thread pointer from __aarch64_read_tp" >;
++
+ // Some INC/DEC forms have better latency and throughput than ADDVL.
+ def FeatureDisableFastIncVL : SubtargetFeature<"disable-fast-inc-vl",
+                                                "HasDisableFastIncVL", "true",
+diff --git a/llvm/lib/Target/AArch64/AArch64InstrInfo.td b/llvm/lib/Target/AArch64/AArch64InstrInfo.td
+index 279507c8d..0dd18c288 100644
+--- a/llvm/lib/Target/AArch64/AArch64InstrInfo.td
++++ b/llvm/lib/Target/AArch64/AArch64InstrInfo.td
+@@ -441,6 +441,9 @@ def AArch64LocalRecover : SDNode<"ISD::LOCAL_RECOVER",
+ def AllowMisalignedMemAccesses
+                     : Predicate<"!Subtarget->requiresStrictAlign()">;
+ 
++def IsReadTPHard : Predicate<"!Subtarget->readTpSoft()">;
++def IsReadTPSoft : Predicate<"Subtarget->readTpSoft()">;
++
+ def UseWzrToVecMove : Predicate<"Subtarget->useWzrToVecMove()">;
+ 
+ def AllowUnpredicatedLdStLower
+@@ -2445,7 +2448,18 @@ def : Pat<(AArch64mrs imm:$id),
+ // The thread pointer (on Linux, at least, where this has been implemented) is
+ // TPIDR_EL0.
+ def MOVbaseTLS : Pseudo<(outs GPR64:$dst), (ins),
+-                       [(set GPR64:$dst, AArch64threadpointer)]>, Sched<[WriteSys]>;
++                       [(set GPR64:$dst, AArch64threadpointer)]>, Sched<[WriteSys]>,
++                       Requires<[IsReadTPHard]>;
++
++// __aarch64_read_tp preserves the registers x1-x7.
++// This is a pseudo inst so that we can get the encoding right,
++// complete with fixup for the aarch64_read_tp function.
++let isCall = 1,
++  Defs = [X0, X16, X17, LR], Uses = [SP] in {
++  def GETbaseTLSsoft : Pseudo<(outs), (ins),
++                       [(set X0, AArch64threadpointer)]>, Sched<[WriteBr]>,
++                       Requires<[IsReadTPSoft]>;
++}
+ 
+ // This gets lowered into a 24-byte instruction sequence
+ let Defs = [ X9, X16, X17, NZCV ], Size = 24 in {
